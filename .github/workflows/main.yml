@@ -1,0 +1,138 @@
+name: Build Nginx Lua + NDK modules
+
+on:
+  workflow_dispatch:          # manual trigger
+  schedule:
+    - cron: '0 4 * * 1'      # every Monday at 04:00 UTC (optional)
+  push:
+    branches: [main]
+
+env:
+  # Change this if you want a specific Nginx version
+  # Leave empty to auto-detect latest mainline from nginx.org
+  NGINX_VERSION: ""
+
+permissions:
+  contents: write    # required for the release step to create releases
+
+jobs:
+  build:
+    outputs:
+      nginx_version: ${{ steps.nginx.outputs.version }}
+    strategy:
+      matrix:
+        # ubuntu-24.04-arm runners are free for public repositories
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential libpcre2-dev zlib1g-dev libssl-dev \
+            libluajit-5.1-dev curl wget tar git
+
+      - name: Detect Nginx version
+        id: nginx
+        run: |
+          if [ -n "${{ env.NGINX_VERSION }}" ]; then
+            VERSION="${{ env.NGINX_VERSION }}"
+          else
+            # Latest mainline from nginx.org
+            VERSION=$(curl -s https://nginx.org/en/download.html | \
+              grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using Nginx $VERSION"
+
+      - name: Download sources
+        run: |
+          NGINX_VER=${{ steps.nginx.outputs.version }}
+
+          # Nginx
+          wget -q https://nginx.org/download/nginx-${NGINX_VER}.tar.gz
+          tar xzf nginx-${NGINX_VER}.tar.gz
+
+          # NDK
+          git clone --depth 1 https://github.com/vision5/ngx_devel_kit.git
+
+          # lua-nginx-module
+          git clone --depth 1 https://github.com/openresty/lua-nginx-module.git
+
+      - name: Build modules
+        run: |
+          NGINX_VER=${{ steps.nginx.outputs.version }}
+          cd nginx-${NGINX_VER}
+
+          # Point lua-nginx-module at system LuaJIT (arch-specific paths)
+          export LUAJIT_LIB=/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+          export LUAJIT_INC=/usr/include/luajit-2.1
+
+          # Important: --with-compat is required for dynamic modules
+          ./configure \
+            --with-compat \
+            --with-http_ssl_module \
+            --add-dynamic-module=../ngx_devel_kit \
+            --add-dynamic-module=../lua-nginx-module
+
+          make modules -j$(nproc)
+
+          # Collect the .so files
+          mkdir -p ../artifacts
+          cp objs/ndk_http_module.so ../artifacts/
+          cp objs/ngx_http_lua_module.so ../artifacts/
+
+          # Also save the exact Nginx version used
+          echo "$NGINX_VER" > ../artifacts/nginx-version.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          # Arch suffix keeps amd64 and arm64 files from overwriting each other
+          name: nginx-lua-modules-${{ steps.nginx.outputs.version }}-${{ matrix.arch }}
+          path: artifacts/
+          retention-days: 90
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # No merge-multiple: each arch goes to its own dir, otherwise
+          # identically-named .so files would overwrite each other
+          path: all-artifacts
+
+      - name: Collect files with arch suffix
+        run: |
+          mkdir -p release-files
+          for dir in all-artifacts/nginx-lua-modules-*/; do
+            arch="${dir##*-}"
+            arch="${arch%/}"
+            for f in ndk_http_module.so ngx_http_lua_module.so; do
+              cp "${dir}${f}" "release-files/${f%.so}-${arch}.so"
+            done
+            cp "${dir}nginx-version.txt" "release-files/nginx-version-${arch}.txt"
+          done
+          ls -la release-files/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nginx-${{ needs.build.outputs.nginx_version }}
+          name: Modules for Nginx ${{ needs.build.outputs.nginx_version }}
+          files: |
+            release-files/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
