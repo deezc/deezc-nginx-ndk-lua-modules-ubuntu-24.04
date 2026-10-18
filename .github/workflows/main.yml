@@ -29,6 +29,7 @@ jobs:
             runner: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.runner }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,7 +39,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential libpcre2-dev zlib1g-dev libssl-dev \
-            libluajit-5.1-dev curl wget tar git
+            curl wget tar git
+
+      - name: Build LuaJIT (static, link into module)
+        run: |
+          git clone --depth 1 https://github.com/openresty/luajit2.git
+          cd luajit2
+          make -j$(nproc)
+          make install PREFIX=$PWD/../luajit-install
+          # keep only the .a so lua-nginx-module links statically
+          find $PWD/../luajit-install -name '*.so*' -delete
+          echo "LUAJIT_LIB=$PWD/../luajit-install/lib" >> "$GITHUB_ENV"
+          echo "LUAJIT_INC=$PWD/../luajit-install/include/luajit-2.1" >> "$GITHUB_ENV"
 
       - name: Detect Nginx version
         id: nginx
@@ -67,14 +79,16 @@ jobs:
           # lua-nginx-module
           git clone --depth 1 https://github.com/openresty/lua-nginx-module.git
 
+          # Required pure-Lua runtime libs for lua-nginx-module (arch-independent)
+          git clone --depth 1 https://github.com/openresty/lua-resty-core.git
+          git clone --depth 1 https://github.com/openresty/lua-resty-lrucache.git
+
       - name: Build modules
         run: |
           NGINX_VER=${{ steps.nginx.outputs.version }}
           cd nginx-${NGINX_VER}
 
-          # Point lua-nginx-module at system LuaJIT (arch-specific paths)
-          export LUAJIT_LIB=/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-          export LUAJIT_INC=/usr/include/luajit-2.1
+          # LUAJIT_LIB / LUAJIT_INC env vars are set by the LuaJIT build step
 
           # Important: --with-compat is required for dynamic modules
           ./configure \
@@ -92,6 +106,14 @@ jobs:
 
           # Also save the exact Nginx version used
           echo "$NGINX_VER" > ../artifacts/nginx-version.txt
+
+          # Bundle the pure-Lua runtime libs required by lua-nginx-module
+          # to run (lua-resty-core and friends)
+          mkdir -p ../artifacts/lualib
+          cp -r ../lua-resty-core/lib/. ../artifacts/lualib/
+          cp -rn ../lua-resty-lrucache/lib/. ../artifacts/lualib/
+          tar czf ../artifacts/nginx-lualib.tar.gz -C ../artifacts lualib
+          rm -rf ../artifacts/lualib
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -124,6 +146,8 @@ jobs:
             done
             cp "${dir}nginx-version.txt" "release-files/nginx-version-${arch}.txt"
           done
+          tar_name=$(ls all-artifacts/*/nginx-lualib.tar.gz | head -1)
+          cp "$tar_name" release-files/nginx-lualib.tar.gz
           ls -la release-files/
 
       - name: Create GitHub Release
