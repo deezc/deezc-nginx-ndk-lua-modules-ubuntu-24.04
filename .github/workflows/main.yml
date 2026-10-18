@@ -3,7 +3,9 @@ name: Build Nginx Lua + NDK modules
 on:
   workflow_dispatch:          # manual trigger
   schedule:
-    - cron: '0 4 * * 1'      # every Monday at 04:00 UTC (optional)
+    # GitHub auto-disables scheduled workflows in public repos after 60 days
+    # without repo activity; see README "Schedule caveats" for options.
+    - cron: '0 4 * * *'      # daily at 04:00 UTC (preflight no-ops if already released)
   push:
     branches: [main]
 
@@ -16,12 +18,49 @@ permissions:
   contents: write    # required for the release step to create releases
 
 jobs:
-  build:
+  # Runs once per trigger so the matrix jobs don't duplicate the version check.
+  preflight:
+    runs-on: ubuntu-24.04
     outputs:
       nginx_version: ${{ steps.nginx.outputs.version }}
+      release_exists: ${{ steps.release.outputs.exists }}
+    steps:
+      - name: Detect Nginx version
+        id: nginx
+        run: |
+          if [ -n "${{ env.NGINX_VERSION }}" ]; then
+            VERSION="${{ env.NGINX_VERSION }}"
+          else
+            # Latest mainline from nginx.org
+            VERSION=$(curl -s https://nginx.org/en/download.html | \
+              grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using Nginx $VERSION"
+
+      - name: Check if release already exists
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Scheduled runs are a no-op when this version is already released.
+          # Pushes and manual dispatches still rebuild and update the release.
+          if gh release view "nginx-${{ steps.nginx.outputs.version }}" \
+               --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: preflight
+    # Scheduled runs skip the rebuild when the release already exists.
+    if: github.event_name != 'schedule' || needs.preflight.outputs.release_exists != 'true'
+    outputs:
+      nginx_version: ${{ needs.preflight.outputs.nginx_version }}
     strategy:
       matrix:
-       
+        # ubuntu-24.04-arm runners are free for public repositories
         include:
           - arch: amd64
             runner: ubuntu-24.04
@@ -53,23 +92,10 @@ jobs:
           echo "LUAJIT_LIB=$PWD/../luajit-install/lib" >> "$GITHUB_ENV"
           echo "LUAJIT_INC=$PWD/../luajit-install/include/luajit-2.1" >> "$GITHUB_ENV"
 
-      - name: Detect Nginx version
-        id: nginx
-        run: |
-          if [ -n "${{ env.NGINX_VERSION }}" ]; then
-            VERSION="${{ env.NGINX_VERSION }}"
-          else
-            # Latest mainline from nginx.org
-            VERSION=$(curl -s https://nginx.org/en/download.html | \
-              grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Using Nginx $VERSION"
-
       - name: Download sources
+        env:
+          NGINX_VER: ${{ needs.preflight.outputs.nginx_version }}
         run: |
-          NGINX_VER=${{ steps.nginx.outputs.version }}
-
           # Nginx
           wget -q https://nginx.org/download/nginx-${NGINX_VER}.tar.gz
           tar xzf nginx-${NGINX_VER}.tar.gz
@@ -85,8 +111,9 @@ jobs:
           git clone --depth 1 https://github.com/openresty/lua-resty-lrucache.git
 
       - name: Build modules
+        env:
+          NGINX_VER: ${{ needs.preflight.outputs.nginx_version }}
         run: |
-          NGINX_VER=${{ steps.nginx.outputs.version }}
           cd nginx-${NGINX_VER}
 
           # LUAJIT_LIB / LUAJIT_INC env vars are set by the LuaJIT build step
@@ -120,13 +147,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           # Arch suffix keeps amd64 and arm64 files from overwriting each other
-          name: nginx-lua-modules-${{ steps.nginx.outputs.version }}-${{ matrix.arch }}
+          name: nginx-lua-modules-${{ needs.preflight.outputs.nginx_version }}-${{ matrix.arch }}
           path: artifacts/
           retention-days: 90
 
   release:
-    needs: build
-    if: github.ref == 'refs/heads/main'
+    needs: [preflight, build]
+    # On schedule, skip when preflight found the release already exists.
+    # Pushes and manual dispatches still update the existing release.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'schedule' || needs.preflight.outputs.release_exists != 'true')
     runs-on: ubuntu-24.04
     steps:
       - name: Download all build artifacts
@@ -154,8 +185,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nginx-${{ needs.build.outputs.nginx_version }}
-          name: Modules for Nginx ${{ needs.build.outputs.nginx_version }}
+          tag_name: nginx-${{ needs.preflight.outputs.nginx_version }}
+          name: Modules for Nginx ${{ needs.preflight.outputs.nginx_version }}
           files: |
             release-files/*
           generate_release_notes: true
