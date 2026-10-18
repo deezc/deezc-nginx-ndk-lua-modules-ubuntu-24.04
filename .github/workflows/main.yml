@@ -21,7 +21,7 @@ jobs:
       nginx_version: ${{ steps.nginx.outputs.version }}
     strategy:
       matrix:
-        # ubuntu-24.04-arm runners are free for public repositories
+       
         include:
           - arch: amd64
             runner: ubuntu-24.04
@@ -45,7 +45,8 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/openresty/luajit2.git
           cd luajit2
-          make -j$(nproc)
+          # -fPIC is required: static LuaJIT gets linked into the .so module
+          make -j$(nproc) XCFLAGS=-fPIC
           make install PREFIX=$PWD/../luajit-install
           # keep only the .a so lua-nginx-module links statically
           find $PWD/../luajit-install -name '*.so*' -delete
